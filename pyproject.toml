@@ -1,0 +1,20 @@
+[project]
+name = "pg-health"
+version = "0.1.0"
+description = "Point-in-time PostgreSQL autovacuum health snapshots"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "psycopg[binary]>=3.2",
+]
+
+[project.scripts]
+pg-health = "pg_health.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
