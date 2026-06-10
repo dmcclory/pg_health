@@ -17,6 +17,7 @@ def _settings():
         max_workers=3, naptime=60, vacuum_threshold=50,
         vacuum_scale_factor=0.2, analyze_threshold=50,
         analyze_scale_factor=0.1, cost_delay=2, cost_limit=200,
+        raw_av_cost_limit=200, vacuum_cost_limit=200,
     )
 
 

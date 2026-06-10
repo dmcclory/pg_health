@@ -85,6 +85,62 @@ class TableAttention:
             return 0.0
         return self.n_tup_hot_upd / self.n_tup_upd
 
+    def health_status(self, stats_reset: str | None, captured_at: str) -> tuple[str, str]:
+        """Return (label, explanation) for table vacuum health.
+
+        Uses dead ratio, write rate, and vacuum frequency to classify:
+        - 'ok'       — vacuum is keeping up
+        - 'warning'  — vacuum runs but falling behind
+        - 'critical' — vacuum starved or never run
+        - 'quiet'    — no significant writes
+        """
+        from datetime import datetime, timezone
+
+        dead_ratio = self.dead_tuple_ratio
+
+        # No churn at all
+        total_churn = self.n_tup_upd + self.n_tup_del
+        if total_churn == 0 and self.dead_tuples == 0:
+            return ("quiet", "no writes")
+
+        # Never vacuumed but has dead tuples
+        if self.autovacuum_count == 0 and self.dead_tuples > 0:
+            return ("critical", "never vacuumed")
+
+        if not stats_reset:
+            # Can't compute rate without a time window
+            if dead_ratio > 50:
+                return ("critical", f"{dead_ratio:.0f}% dead")
+            if dead_ratio > 10:
+                return ("warning", f"{dead_ratio:.0f}% dead")
+            return ("ok", f"{dead_ratio:.0f}% dead")
+
+        try:
+            reset_dt = datetime.fromisoformat(stats_reset.replace("Z", "+00:00"))
+            cap_dt = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+            hours = max((cap_dt - reset_dt).total_seconds() / 3600, 0.01)
+        except (ValueError, TypeError):
+            return ("ok", "")
+
+        vacuums_per_hour = self.autovacuum_count / hours
+        writes_per_hour = total_churn / hours
+
+        # High dead ratio + vacuum is running = falling behind
+        if dead_ratio > 50:
+            if vacuums_per_hour > 0.5:
+                return ("warning", f"av every {60/vacuums_per_hour:.0f}m but still {dead_ratio:.0f}% dead")
+            return ("critical", f"{dead_ratio:.0f}% dead, av every {hours/max(self.autovacuum_count,1):.1f}h")
+
+        if dead_ratio > 10:
+            if vacuums_per_hour > 0.1:
+                return ("warning", f"{dead_ratio:.0f}% dead, av every {60/vacuums_per_hour:.0f}m")
+            return ("critical", f"{dead_ratio:.0f}% dead, infrequent av")
+
+        # Low dead ratio — is vacuum keeping up?
+        if vacuums_per_hour > 0:
+            return ("ok", f"av every {60/vacuums_per_hour:.0f}m, {writes_per_hour:.0f} writes/h")
+        return ("ok", f"{dead_ratio:.0f}% dead")
+
 
 # ---------------------------------------------------------------------------
 # Running vacuums (from pg_stat_progress_vacuum, PG 14+)
@@ -215,6 +271,9 @@ class PgHealthSnapshot:
 def from_dict(data: dict) -> PgHealthSnapshot:
     """Build a PgHealthSnapshot from a dict (e.g. parsed JSON)."""
     settings_data = data["settings"]
+    av_cost_limit = settings_data.get("av_cost_limit", settings_data.get("raw_av_cost_limit", -1))
+    vacuum_cost_limit = settings_data.get("vacuum_cost_limit", 200)
+    cost_limit = av_cost_limit if av_cost_limit != -1 else vacuum_cost_limit
     settings = AutovacuumSettings(
         max_workers=settings_data["max_workers"],
         naptime=settings_data["naptime"],
@@ -223,7 +282,9 @@ def from_dict(data: dict) -> PgHealthSnapshot:
         analyze_threshold=settings_data["analyze_threshold"],
         analyze_scale_factor=settings_data["analyze_scale_factor"],
         cost_delay=settings_data["cost_delay"],
-        cost_limit=settings_data["cost_limit"],
+        cost_limit=cost_limit,
+        raw_av_cost_limit=av_cost_limit,
+        vacuum_cost_limit=vacuum_cost_limit,
     )
 
     worker_data = data.get("worker_saturation", {})

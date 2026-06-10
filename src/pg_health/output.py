@@ -92,13 +92,16 @@ def to_text(snapshot: PgHealthSnapshot) -> str:
     # Tables needing attention
     if snapshot.tables_needing_attention:
         lines.append(f"  Tables needing attention ({len(snapshot.tables_needing_attention)}):")
-        lines.append(f"  {'Table':<50} {'Dead':>8} {'Dead%':>7} {'Avg AV interval':>16} {'Reason'}")
+        lines.append(f"  {'Table':<40} {'Health':<12} {'Dead':>8} {'Dead%':>7}  {'Avg AV':>8} {'Reason'}")
         lines.append("  " + "-" * 130)
         for t in snapshot.tables_needing_attention[:20]:
             label = f"{t.schema}.{t.table}"
+            health_label, health_detail = t.health_status(snapshot.stats_reset, snapshot.captured_at)
+            health_icons = {"ok": "✅", "warning": "⚠️", "critical": "❌", "quiet": "ℹ️"}
+            icon = health_icons.get(health_label, "")
             avg_interval = _avg_interval(t.autovacuum_count, snapshot.stats_reset, snapshot.captured_at)
             lines.append(
-                f"  {label:<50} {_fmt(t.dead_tuples):>8} {t.dead_tuple_ratio:>6.1f}% {avg_interval:>16} {t.reason}"
+                f"  {label:<40} {icon} {health_label:<8} {_fmt(t.dead_tuples):>8} {t.dead_tuple_ratio:>6.1f}%  {avg_interval:>8} {t.reason}"
             )
         if len(snapshot.tables_needing_attention) > 20:
             lines.append(f"  ... and {len(snapshot.tables_needing_attention) - 20} more")
@@ -176,6 +179,7 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
   .badge-ok {{ background: #d1e7dd; color: #0f5132; }}
   .badge-warning {{ background: #fff3cd; color: #664d03; }}
   .badge-critical {{ background: #f8d7da; color: #842029; }}
+  .badge-quiet {{ background: #e2e3e5; color: #41464b; }}
   .reason {{ color: #dc3545; }}
   footer {{ margin-top: 2rem; color: #6c757d; font-size: 0.8rem; text-align: center; }}
 </style>
@@ -261,16 +265,19 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
         html += f"""  <h2>Tables Needing Attention ({len(snapshot.tables_needing_attention)})</h2>
   <div class="card">
     <table>
-      <thead><tr><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th><th>HOT Ratio</th><th>Last AV</th><th>Avg AV interval</th><th>Reason</th></tr></thead>
+      <thead><tr><th>Table</th><th>Health</th><th>Live</th><th>Dead</th><th>Dead %</th><th>HOT Ratio</th><th>Last AV</th><th>Avg AV interval</th><th>Reason</th></tr></thead>
       <tbody>
 """
         for t in snapshot.tables_needing_attention[:50]:
             hot = f"{t.hot_update_ratio:.0%}" if t.hot_update_ratio > 0 else "n/a"
             last_av = _fmt_time(t.last_autovacuum) if t.last_autovacuum else "never"
             avg = _avg_interval(t.autovacuum_count, snapshot.stats_reset, snapshot.captured_at)
+            health_label, health_detail = t.health_status(snapshot.stats_reset, snapshot.captured_at)
+            badge_class = f"badge-{health_label}"
             html += (
                 f"        <tr>"
                 f"<td>{_esc(t.schema)}.{_esc(t.table)}</td>"
+                f"<td><span class=\"badge {badge_class}\">{_esc(health_label)}</span><br><small>{_esc(health_detail)}</small></td>"
                 f"<td>{_fmt(t.live_tuples)}</td>"
                 f"<td>{_fmt(t.dead_tuples)}</td>"
                 f"<td>{t.dead_tuple_ratio:.1f}%</td>"
