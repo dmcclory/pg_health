@@ -30,7 +30,8 @@ SELECT
     (SELECT setting::int  FROM pg_settings WHERE name = 'autovacuum_analyze_threshold')   AS analyze_threshold,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'autovacuum_analyze_scale_factor') AS analyze_scale_factor,
     (SELECT setting::float8 FROM pg_settings WHERE name = 'autovacuum_vacuum_cost_delay') AS cost_delay,
-    (SELECT setting::int  FROM pg_settings WHERE name = 'autovacuum_vacuum_cost_limit')   AS cost_limit;
+    (SELECT setting::int  FROM pg_settings WHERE name = 'autovacuum_vacuum_cost_limit')   AS av_cost_limit,
+    (SELECT setting::int  FROM pg_settings WHERE name = 'vacuum_cost_limit')              AS vacuum_cost_limit;
 """
 
 _QUERY_TABLES = """
@@ -125,6 +126,10 @@ FROM pg_database
 WHERE datname = current_database();
 """
 
+_QUERY_STATS_RESET = """
+SELECT stats_reset FROM pg_stat_database WHERE datname = current_database();
+"""
+
 _QUERY_VERSION = """
 SELECT version();
 """
@@ -161,7 +166,7 @@ class Collector:
         now = datetime.now(timezone.utc)
         now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        with psycopg.connect(self.dsn) as conn:
+        with psycopg.connect(self.dsn, autocommit=True) as conn:
             settings = self._fetch_settings(conn)
             tables = self._fetch_tables(conn)
             reloptions = self._fetch_reloptions(conn)
@@ -170,6 +175,7 @@ class Collector:
             active_workers = self._fetch_active_workers(conn)
             xid = self._fetch_xid(conn)
             version_str = self._fetch_version(conn)
+            stats_reset = self._fetch_stats_reset(conn)
             db_name = conn.info.dbname or ""
 
         schemas = _rollup_schemas(tables, reloptions)
@@ -206,6 +212,7 @@ class Collector:
             schemas_needing_vacuum=schemas_needing,
             worker_saturation=worker_sat,
             xid_health=xid,
+            stats_reset=stats_reset,
             schemas=schemas,
             tables_needing_attention=tables_attention,
             running_vacuums=running_vacuums,
@@ -218,6 +225,9 @@ class Collector:
 
     def _fetch_settings(self, conn) -> AutovacuumSettings:
         row = conn.execute(_QUERY_SETTINGS).fetchone()
+        av_cost_limit = row[7]
+        vacuum_cost_limit = row[8]
+        cost_limit = av_cost_limit if av_cost_limit != -1 else vacuum_cost_limit
         return AutovacuumSettings(
             max_workers=row[0],
             naptime=row[1],
@@ -226,7 +236,9 @@ class Collector:
             analyze_threshold=row[4],
             analyze_scale_factor=row[5],
             cost_delay=row[6],
-            cost_limit=row[7],
+            cost_limit=cost_limit,
+            raw_av_cost_limit=av_cost_limit,
+            vacuum_cost_limit=vacuum_cost_limit,
         )
 
     def _fetch_tables(self, conn) -> list[dict]:
@@ -313,6 +325,13 @@ class Collector:
     def _fetch_version(self, conn) -> str:
         row = conn.execute(_QUERY_VERSION).fetchone()
         return row[0]
+
+    def _fetch_stats_reset(self, conn) -> str | None:
+        row = conn.execute(_QUERY_STATS_RESET).fetchone()
+        ts = row[0]
+        if ts:
+            return str(ts).replace(" ", "T") + "Z"
+        return None
 
     # --- helpers ---
 
@@ -563,6 +582,7 @@ class FileCollector:
             schemas_needing_vacuum=schemas_needing,
             worker_saturation=worker_sat,
             xid_health=xid,
+            stats_reset=data.get("stats_reset") or data.get("stats_reset_reset"),
             schemas=schemas,
             tables_needing_attention=tables_attention,
             running_vacuums=running_vacuums,

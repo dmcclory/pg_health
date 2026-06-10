@@ -61,6 +61,18 @@ def to_text(snapshot: PgHealthSnapshot) -> str:
     xid_icon = {"ok": "✓", "warning": "⚠", "critical": "✗"}[xid.status]
     lines.append(f"  XID age: {_fmt(xid.xid_age)} [{xid_icon} {xid.status}]")
 
+    # Autovacuum settings
+    s = snapshot.settings
+    lines.append("")
+    lines.append("  Autovacuum settings:")
+    lines.append(
+        f"  Workers: {s.max_workers}  |  Naptime: {s.naptime}s"
+        f"  |  Threshold: {s.vacuum_threshold} + {s.vacuum_scale_factor} × rows"
+    )
+    lines.append(
+        f"  Cost delay: {s.cost_delay}ms  |  Cost limit: {s.cost_limit}"
+    )
+
     lines.append("")
 
     # Schema summary
@@ -80,12 +92,13 @@ def to_text(snapshot: PgHealthSnapshot) -> str:
     # Tables needing attention
     if snapshot.tables_needing_attention:
         lines.append(f"  Tables needing attention ({len(snapshot.tables_needing_attention)}):")
-        lines.append(f"  {'Table':<50} {'Dead':>8} {'Dead%':>7} {'Reason'}")
-        lines.append("  " + "-" * 110)
+        lines.append(f"  {'Table':<50} {'Dead':>8} {'Dead%':>7} {'Avg AV interval':>16} {'Reason'}")
+        lines.append("  " + "-" * 130)
         for t in snapshot.tables_needing_attention[:20]:
             label = f"{t.schema}.{t.table}"
+            avg_interval = _avg_interval(t.autovacuum_count, snapshot.stats_reset, snapshot.captured_at)
             lines.append(
-                f"  {label:<50} {_fmt(t.dead_tuples):>8} {t.dead_tuple_ratio:>6.1f}% {t.reason}"
+                f"  {label:<50} {_fmt(t.dead_tuples):>8} {t.dead_tuple_ratio:>6.1f}% {avg_interval:>16} {t.reason}"
             )
         if len(snapshot.tables_needing_attention) > 20:
             lines.append(f"  ... and {len(snapshot.tables_needing_attention) - 20} more")
@@ -115,6 +128,8 @@ def to_text(snapshot: PgHealthSnapshot) -> str:
 
     # Footer
     lines.append(f"  Captured at {snapshot.captured_at}")
+    if snapshot.stats_reset:
+        lines.append(f"  Stats since {_fmt_time(snapshot.stats_reset)}")
     if snapshot.previous_snapshot_ref:
         lines.append(f"  Reference: {snapshot.previous_snapshot_ref}")
 
@@ -190,6 +205,28 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
       </div>
     </div>
   </div>
+
+  <h2>Autovacuum Settings</h2>
+  <div class="card">
+    <div class="grid">
+      <div class="metric">
+        <div class="value">{snapshot.settings.max_workers}</div>
+        <div class="label">Max Workers</div>
+      </div>
+      <div class="metric">
+        <div class="value">{snapshot.settings.naptime}s</div>
+        <div class="label">Naptime</div>
+      </div>
+      <div class="metric">
+        <div class="value">{snapshot.settings.vacuum_threshold} + {snapshot.settings.vacuum_scale_factor}×rows</div>
+        <div class="label">Vacuum Trigger</div>
+      </div>
+      <div class="metric">
+        <div class="value">{snapshot.settings.cost_delay}ms / {snapshot.settings.cost_limit}</div>
+        <div class="label">Cost Delay / Limit</div>
+      </div>
+    </div>
+  </div>
 """
 
     # Schema table
@@ -224,12 +261,13 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
         html += f"""  <h2>Tables Needing Attention ({len(snapshot.tables_needing_attention)})</h2>
   <div class="card">
     <table>
-      <thead><tr><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th><th>HOT Ratio</th><th>Last AV</th><th>Reason</th></tr></thead>
+      <thead><tr><th>Table</th><th>Live</th><th>Dead</th><th>Dead %</th><th>HOT Ratio</th><th>Last AV</th><th>Avg AV interval</th><th>Reason</th></tr></thead>
       <tbody>
 """
         for t in snapshot.tables_needing_attention[:50]:
             hot = f"{t.hot_update_ratio:.0%}" if t.hot_update_ratio > 0 else "n/a"
             last_av = _fmt_time(t.last_autovacuum) if t.last_autovacuum else "never"
+            avg = _avg_interval(t.autovacuum_count, snapshot.stats_reset, snapshot.captured_at)
             html += (
                 f"        <tr>"
                 f"<td>{_esc(t.schema)}.{_esc(t.table)}</td>"
@@ -238,6 +276,7 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
                 f"<td>{t.dead_tuple_ratio:.1f}%</td>"
                 f"<td>{hot}</td>"
                 f"<td>{_esc(last_av)}</td>"
+                f"<td>{_esc(avg)}</td>"
                 f"<td class=\"reason\">{_esc(t.reason)}</td>"
                 f"</tr>\n"
             )
@@ -295,7 +334,10 @@ def to_html(snapshot: PgHealthSnapshot) -> str:
   </div>
 """
 
-    html += f"""  <footer>Captured at {_esc(snapshot.captured_at)}</footer>
+    html += f"""  <footer>
+    Captured at {_esc(snapshot.captured_at)}
+    {f"· Stats since {_esc(_fmt_time(snapshot.stats_reset))}" if snapshot.stats_reset else ""}
+  </footer>
 </div>
 </body>
 </html>"""
@@ -349,6 +391,26 @@ def _fmt_time(ts: str) -> str:
         return f"{minutes}m ago"
     except (ValueError, TypeError):
         return ts
+
+
+def _avg_interval(count: int, stats_reset: str | None, captured_at: str) -> str:
+    """Calculate average autovacuum interval since stats reset."""
+    if not stats_reset or count == 0:
+        return "—"
+    try:
+        reset_dt = datetime.fromisoformat(stats_reset.replace("Z", "+00:00"))
+        cap_dt = datetime.fromisoformat(captured_at.replace("Z", "+00:00"))
+        total_seconds = (cap_dt - reset_dt).total_seconds()
+        avg_seconds = total_seconds / count
+        if avg_seconds >= 86400:
+            return f"{avg_seconds / 86400:.1f}d"
+        if avg_seconds >= 3600:
+            return f"{avg_seconds / 3600:.1f}h"
+        if avg_seconds >= 60:
+            return f"{avg_seconds / 60:.0f}m"
+        return f"{avg_seconds:.0f}s"
+    except (ValueError, TypeError):
+        return "—"
 
 
 def _esc(s: str) -> str:

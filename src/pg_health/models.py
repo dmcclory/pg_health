@@ -18,7 +18,9 @@ class AutovacuumSettings:
     analyze_threshold: int
     analyze_scale_factor: float
     cost_delay: float        # ms; can be fractional in newer PG
-    cost_limit: int
+    cost_limit: int          # resolved (av_cost_limit if set, else vacuum_cost_limit)
+    raw_av_cost_limit: int   # the actual av_cost_limit value (-1 means inherit)
+    vacuum_cost_limit: int   # cluster-wide default
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +191,7 @@ class PgHealthSnapshot:
     schemas_needing_vacuum: int
     worker_saturation: WorkerSaturation
     xid_health: XidHealth
+    stats_reset: Optional[str] = None  # ISO-8601; when stats counters were last zeroed
     schemas: List[SchemaHealth] = field(default_factory=list)
     tables_needing_attention: List[TableAttention] = field(default_factory=list)
     running_vacuums: List[RunningVacuum] = field(default_factory=list)
@@ -260,4 +263,5 @@ def from_dict(data: dict) -> PgHealthSnapshot:
         ],
         xid_health=xid,
         previous_snapshot_ref=data.get("previous_snapshot_ref"),
+        stats_reset=data.get("stats_reset"),
     )
